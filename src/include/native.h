@@ -1,3 +1,23 @@
+/*
+ * ============================================================================
+ * 【中文导读】native.h —— 在 PC 上跑单元测试时伪造的 Arduino 环境
+ * ----------------------------------------------------------------------------
+ * 文件职责：
+ *   让 src/ 与 lib/ 里的业务代码不修改一行就能在 x86 上编译运行：
+ *   1) 伪造引脚宏（GPIO_PIN_BUSY/NSS_2/SPI_VTX_NSS 全设为 UNDEF_PIN）；
+ *   2) 伪造 Stream/HardwareSerial 类，write 直接丢弃、read 返回 -1；
+ *   3) 用 gettimeofday 实现 micros()，用可写全局量实现 millis()；
+ *   4) 提供 min/constrain/bit/itoa 等 Arduino 宏；
+ *   5) 在 Windows 上补 strlcpy/stpcpy/strlcat 与 random()。
+ *
+ * 关键设计：nativeClockMs() 返回一个“可写的毫秒时钟”引用，
+ *   测试代码可以写 `nativeClockMs() += 1000;` 来快进时间，
+ *   无需真的 sleep——这是所有超时/心跳类单测能瞬间跑完的原因。
+ *
+ * 注意：本文件只在 TARGET_NATIVE 下由 targets.h 包含，
+ *   真实固件编译时完全不存在，因此可以自由使用 <unistd.h>/<sys/time.h>。
+ * ============================================================================
+ */
 #pragma once
 
 #include <stdint.h>

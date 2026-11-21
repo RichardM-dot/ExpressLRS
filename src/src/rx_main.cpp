@@ -8,6 +8,20 @@
  * ============================================================================
  */
 
+/*
+ * ----------------------------------------------------------------------------
+ * 【阅读地图】本文件的执行骨架
+ *   setup()                —— 配置/串口/设备/射频初始化，随即 RXnb() 进入守听
+ *   loop()                 —— 主循环：状态机（tentative→connected→lost）、
+ *                             速率轮询(cycleRfMode)、绑定、串口收发、遥测泵
+ *   RXdoneISR()            —— 收包 ISR：CRC → 解包 → 喂 PFD 相位检测
+ *   HWtimerCallbackTick()  —— 半拍回调（180°反相）：结算 LQ、清 TLM 标志
+ *   HWtimerCallbackTock()  —— 整拍回调：跳频 → 分集 → 发遥测 → 相位校准
+ * 与 TX 的对称性：TX 的 timerCallback 只负责“发”，RX 的 Tock 同时负责
+ * “跳频 + 可能发遥测”，因此 RX 的 ISR 负担更重，任何新增逻辑都要评估耗时。
+ * ----------------------------------------------------------------------------
+ */
+
 #include "CRSFRouter.h"
 #include "LowPassFilter.h"
 #include "rxtx_common.h"
@@ -219,16 +233,31 @@ bool BindingModeRequest = false;
 extern void setWifiUpdateMode();
 void reconfigureSerial();
 
+/**
+ * @brief 暴露给串口驱动/Web UI 的实时 LQ（百分比）
+ * @return 最近 100 个包周期的成功率 0..100
+ * @note 读的是 ISR 会修改的滑动窗口，返回值允许有 1 帧误差，不需要加锁。
+ */
 uint8_t getLq()
 {
     return LQCalc.getLQ();
 }
 
+/**
+ * @brief 取一份 GPS 驱动状态快照（供 Web UI / 遥测使用）
+ * @param out 输出结构，POD，按值拷贝
+ * @return false 表示当前没有运行 GPS 驱动
+ */
 bool getGpsTelemetry(gps_telemetry_t &out)
 {
     return SerialGPS::getTelemetryInfo(out);
 }
 
+/**
+ * @brief 根据硬件与配置决定是否进入 Gemini（双射频同收）模式
+ * @note 双频段模式强制 Gemini：既然两颗射频分别在不同频段，只收一个没有意义。
+ *       单射频硬件上 geminiMode 恒为 0。
+ */
 static inline void checkGeminiMode()
 {
     if (isDualRadio())
@@ -237,6 +266,16 @@ static inline void checkGeminiMode()
     }
 }
 
+/**
+ * @brief 计算“稳定连接”所需的最小 LQ 阈值
+ * @return 阈值（百分比），LQ 必须严格大于它才认为连接可信
+ * @note 推导：在 100 拍的 LQ 窗口内，若跳频表有 numfhss 个频道、每
+ *       FHSHopInterval 拍跳一次，那么一个完整的 FHSS 周期有
+ *       interval*numfhss 拍；100 拍内最多与之“同频相遇” ceil(100/(interval*numfhss)) 次，
+ *       每次收到 interval 个包。所以单频干扰源最多能伪造出这么多 LQ。
+ *       阈值取这个值，是为了防止“某个强干扰源恰好一直停在我的某个频点上”
+ *       被误判为已连接（RX 会因此停止速率轮询，永远连不上）。
+ */
 static uint8_t minLqForChaos()
 {
     // Determine the most number of CRC-passing packets we could receive on
@@ -253,6 +292,15 @@ static uint8_t minLqForChaos()
     return interval * ((interval * numfhss + 99) / (interval * numfhss));
 }
 
+/**
+ * @brief 把最近一包的 RSSI/SNR/天线信息写进 linkStats（ISR 内调用）
+ * @note 单/双射频分支不同：
+ *       - 双射频：两路 RSSI 各自过 LPF，且用 GetProcessingPacketRadio() 判断
+ *         本包是从哪颗射频收到的，据此填 active_antenna；
+ *       - 单射频 + 外置天线切换：只有当前天线的 LPF 被更新，另一路保留旧值，
+ *         这样上位机能看出“另一根天线有多久没收到东西了”。
+ *       所有 RSSI 都被钳到 <=0 再取反，防止驱动返回正数导致 CRSF 字段溢出。
+ */
 void ICACHE_RAM_ATTR getRFlinkInfo()
 {
     int32_t rssiDBM = Radio.LastPacketRSSI;
@@ -314,6 +362,16 @@ void ICACHE_RAM_ATTR getRFlinkInfo()
     #endif
 }
 
+/**
+ * @brief 切换空口速率（RX 侧）
+ * @param index 档位下标
+ * @param bindMode true 表示绑定模式，强制 invertIQ 且用绑定频率
+ * @note 与 TX 版本的区别：
+ *       - 没有“幂等短路”，因为 RX 需要能被动跟随 TX 的任意次重配；
+ *       - 额外计算 cycleInterval（扫完整个跳频表所需时间的 110%），
+ *         供 cycleRfMode() 判断“这个速率试够久了，换下一个”；
+ *       - 末尾 LbtEnableIfRequired() 决定是否启用先听后发。
+ */
 void SetRFLinkRate(uint8_t index, bool bindMode) // Set speed of RF link
 {
     expresslrs_mod_settings_s *const ModParams = get_elrs_airRateConfig(index);
@@ -382,6 +440,16 @@ void SetRFLinkRate(uint8_t index, bool bindMode) // Set speed of RF link
     LbtEnableIfRequired();
 }
 
+/**
+ * @brief 跳频执行体：按 nonce 与 FHSHopInterval 决定本拍是否换频
+ * @note 三个提前返回条件缺一不可：
+ *       - FHSHopInterval==0（极少数特殊档位不跳频）；
+ *       - InBindingMode（绑定必须锁频）；
+ *       - connectionState==disconnected（未同步时不能跳，否则永远对不上）；
+ *       Gemini 模式下两颗射频要在“同一时刻”写不同频率，
+ *       代码特意安排先写 radio1 再写 radio2 以优化 SPI 复用顺序。
+ *       SX127x 跳频后必须重新 RXnb()，因为该芯片跳频会退出接收模式。
+ */
 static void ICACHE_RAM_ATTR HandleFHSS()
 {
     uint8_t modresultFHSS = OtaNonce % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
@@ -423,6 +491,14 @@ static void ICACHE_RAM_ATTR HandleFHSS()
     LbtCcaTimerStart();
 }
 
+/**
+ * @brief 把本地 linkStats 打包成空口 OTA_LinkStats_s（位域压缩版）
+ * @param ls 输出，指向 OTA 包内的 stats 字段
+ * @note 与 TX 的 LinkStatsFromOta() 严格互逆：
+ *       RSSI 以正值占 7 bit，最高位存天线号；modelMatch 存进 RSSI_2 的最高位；
+ *       LQ 占 7 bit，最高位存“是否具备真分集”；SNR 用 8 bit 有符号定点。
+ *       SNR 取的是均值（SnrMean）而非瞬时值，避免单包抖动让动态功率误动作。
+ */
 void ICACHE_RAM_ATTR LinkStatsToOta(OTA_LinkStats_s * const ls)
 {
     // The value in linkstatistics is "positivized" (inverted polarity)
@@ -469,7 +545,18 @@ void ICACHE_RAM_ATTR LinkStatsToOta(OTA_LinkStats_s * const ls)
         if (ls) LinkStatsToOta(ls); \
     } \
 }
+// 注意：该宏以 otaPkt / otaPktGemini / geminiMode / sendGeminiBuffer 为隐式上下文，
+// 只能在 HandleSendDataDl() 内展开。宏体用 \ 续行，因此本行注释必须放在宏之后，
+// 绝不能插进宏体内部（会改变展开结果）。
 
+/**
+ * @brief 组装并发送一个下行遥测包（LinkStats 或 DATA）
+ * @return true 表示本拍确实占用了一次发射机会
+ * @note 七个提前返回条件里最容易被忽略的是 alreadyTLMresp：
+ *       它保证“一个遥测窗口只发一包”，否则 RX 会在同一窗口连发多包，
+ *       把 TX 的接收窗口挤爆。teamraceHasModelMatch 为假时禁发，
+ *       防止“借来的模型”把遥测发到别人的链路里。
+ */
 bool ICACHE_RAM_ATTR HandleSendDataDl()
 {
     uint8_t modresult = OtaNonce % ExpressLRS_currTlmDenom;
@@ -582,6 +669,15 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
     return true;
 }
 
+/**
+ * @brief 依据射频芯片报的频偏方向，微调本机晶振补偿值
+ * @param value true 表示“本机偏快”，需要减一个 FREQ_STEP
+ * @param radio 哪颗射频（Gemini 两颗各有一套补偿值）
+ * @return 调整后的补偿值（单位 FREQ_STEP）
+ * @note 每包最多调 1 个 step，且用 FreqCorrectionMin/Max 钳位：
+ *       调得太快会造成频率振荡，反而解不出包。SX127x 还要把该值写进
+ *       解调器的 PPM offset 寄存器（见 ProcessRFPacket 的调用点）。
+ */
 int32_t ICACHE_RAM_ATTR HandleFreqCorr(bool value, SX12XX_Radio_Number_t radio)
 {
     int32_t tempFC = FreqCorrection;
@@ -625,6 +721,15 @@ int32_t ICACHE_RAM_ATTR HandleFreqCorr(bool value, SX12XX_Radio_Number_t radio)
     return tempFC;
 }
 
+/**
+ * @brief 用 PFD（相位频率检测）结果校准定时器相位与晶振频率
+ * @note 两条通路，速率不同：
+ *       1) 相位：每拍都调，用 LPF 后的 offset >> 2（已锁定时）或 raw >> 1
+ *          （未锁定时更激进，为了快速追上）；
+ *       2) 频率：只在 tim_locked 且 OtaNonce%8==0 时每 8 拍调一步，
+ *          防止与相位环互相抢调节权造成抖动。
+ *       本函数末尾一定会 PFDloop.reset()，否则下一拍会拿旧数据重复计算。
+ */
 void ICACHE_RAM_ATTR updatePhaseLock()
 {
     if (connectionState != disconnected && PFDloop.hasResult())
@@ -666,6 +771,13 @@ void ICACHE_RAM_ATTR updatePhaseLock()
     PFDloop.reset();
 }
 
+/**
+ * @brief 半拍回调（与 Tock 相差 180°）：结算 LQ 并推进滑动窗口
+ * @note 为什么要在“半拍”而不是 Tock 结算：Tock 里要跳频/发遥测，耗时不确定；
+ *       放在包中间的空闲点结算，能保证 LQ 的采样时刻固定，不受发射耗时影响。
+ *       另外只要本拍发过遥测（alreadyTLMresp），就不推进 LQ 窗口，
+ *       因为那段时间 RX 在发射、本来就不该收到包。
+ */
 void ICACHE_RAM_ATTR HWtimerCallbackTick() // this is 180 out of phase with the other callback, occurs mid-packet reception
 {
     if (ExpressLRS_currAirRate_Modparams->numOfSends == 1)
@@ -690,6 +802,12 @@ void ICACHE_RAM_ATTR HWtimerCallbackTick() // this is 180 out of phase with the 
 //////////////////////////////////////////////////////////////
 // flip to the other antenna
 // no-op if GPIO_PIN_ANT_CTRL not defined
+/**
+ * @brief 切换到另一根天线，并丢弃旧天线的 RSSI 滤波值
+ * @note 只在天线模式==2（真分集）时生效；0/1 是“固定用某根天线”。
+ *       reset() 是必须的：切换瞬间 RSSI 会跳变，若继续用旧滤波值，
+ *       分集算法会误判“切换让信号变差”而立刻切回去，形成来回抖动。
+ */
 static inline void switchAntenna()
 {
     if (GPIO_PIN_ANT_CTRL != UNDEF_PIN && config.GetAntennaMode() == 2)
@@ -702,6 +820,14 @@ static inline void switchAntenna()
     }
 }
 
+/**
+ * @brief 单射频 + 双天线的分集决策（每拍调用一次）
+ * @note 算法是“三段式状态机”，全部用函数内 static 保存：
+ *       1) RSSI 相对上次下降超过 5dB，且已稳定观察 5 拍 → 换天线；
+ *       2) 连续丢包且刚换过天线 → 立刻再换（可能是遮挡方向变了）；
+ *       3) 换过天线后比较两天线 RSSI，若变差就换回，否则清标志保持。
+ *       用 5 拍的观察窗是为了避免“切换→RSSI 抖动→再切换”的高频震荡。
+ */
 static void ICACHE_RAM_ATTR updateDiversity()
 {
 
@@ -771,6 +897,17 @@ static void ICACHE_RAM_ATTR updateDiversity()
     }
 }
 
+/**
+ * @brief 整拍回调（Tock）：RX 的“主心跳”，每 packet interval 一次
+ * @note 执行顺序经过精心排序，任何插入都可能破坏时序：
+ *       1) PFDloop.intEvent() 记录“本机节拍时刻”，供相位检测算偏差；
+ *       2) 若本拍是一组 DVDA 的结尾，按 LQCalcDVDA 判断这一组是否算收到；
+ *       3) sendImmediateRC()：让 CRSF/SBUS 等串口按时序输出；
+ *       4) OtaNonce++ 后 HandleFHSS()：跳到下一频点；
+ *       5) updateDiversity()：可能要写天线 GPIO；
+ *       6) HandleSendDataDl()：轮到自己发遥测就发；
+ *       7) updatePhaseLock()：最后校准，避免影响本拍已算好的时序。
+ */
 void ICACHE_RAM_ATTR HWtimerCallbackTock()
 {
     PFDloop.intEvent(micros()); // our internal osc just fired
@@ -816,6 +953,14 @@ void ICACHE_RAM_ATTR HWtimerCallbackTock()
     #endif
 }
 
+/**
+ * @brief 彻底“掉线复位”：清统计、停定时器、回到初始频率重新守听
+ * @param resumeRx true 表示复位后立刻 RXnb() 继续收；false 用于要接管射频的场合
+ * @note 那个 while 循环很关键：它等到“刚过 Tock 点 250us 以上”才停定时器，
+ *       避免在 Tock 正在执行时被停止（会造成定时器状态不一致/重复中断）。
+ *       注意本函数不重置 InBindingMode 之外的配置，也不改 connectionState
+ *       之外的状态机变量——调用者负责后续动作。
+ */
 void LostConnection(bool resumeRx)
 {
     DBGLN("lost conn fc=%d fo=%d", FreqCorrection, hwTimer::getFreqOffset());
@@ -849,6 +994,15 @@ void LostConnection(bool resumeRx)
     }
 }
 
+/**
+ * @brief 收到 SYNC 后进入“试探连接”：清通道、清 PFD、记录候选速率
+ * @param now 当前 millis
+ * @note 这里把当前档位写进 config.SetRateInitialIdx()，下次上电会优先试这一档，
+ *       相当于“记住上次成功的速率”，能显著加快冷启动。
+ *       同时把 PowerOnCounter 清零：能连上说明不是“三插拔绑定”意图。
+ *       调用者必须自己调用 hwTimer::resume()——因为一旦恢复定时器，
+ *       ISR 会立刻抢占当前代码，不能在函数内部做。
+ */
 void ICACHE_RAM_ATTR TentativeConnection(unsigned long now)
 {
     PFDloop.reset();
@@ -875,6 +1029,14 @@ void ICACHE_RAM_ATTR TentativeConnection(unsigned long now)
     // the timer ISR will fire immediately and preempt any other code
 }
 
+/**
+ * @brief 从 tentative 升级为 connected（真正可用）
+ * @param now 当前 millis
+ * @note 这里的 LockRFmode = firmwareOptions.lock_on_first_connection 是“竞赛锁频”：
+ *       连上后不再轮询其它速率，避免比赛途中掉线后跑到别的档位上找不回来。
+ *       RXtimerState 设为 tim_tentative（而不是 locked），表示还需要再观察
+ *       ConsiderConnGoodMillis 才能让相位环进入“慢调”模式。
+ */
 void GotConnection(unsigned long now)
 {
     if (connectionState == connected)
@@ -898,6 +1060,16 @@ void GotConnection(unsigned long now)
     DBGLN("got conn");
 }
 
+/**
+ * @brief 处理 RC 通道包（PACKET_TYPE_RCDATA）
+ * @param otaPktPtr 已通过 CRC 的 OTA 包
+ * @note 三道闸门：
+ *       1) 必须 connected 且没有待处理的开关模式切换（SwitchModePending），
+ *          否则解包会用错位宽；
+ *       2) 解包结果里的 ack 位要回填给 DataDlSender（下行数据确认）；
+ *       3) 只有 modelMatch 且“通道数据完整”才真正通知串口/舵机输出。
+ *       DVDA 多连发档位不在此处计 LQ，而是攒到 LQCalcDVDA，由 Tock 统一结算。
+ */
 static void ICACHE_RAM_ATTR ProcessRfPacket_RC(OTA_Packet_s const * const otaPktPtr)
 {
     // Must be fully connected to process RC packets, prevents processing RC
@@ -931,6 +1103,13 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_RC(OTA_Packet_s const * const otaPkt
     }
 }
 
+/**
+ * @brief 处理绑定 MSP：把 TX 发来的 4 字节 UID 写进 RAM 缓存
+ * @param newUid4 指向载荷第 2 字节，长度 4
+ * @note UID[0]/UID[1] 被强制清零是协议约定（见 SendUIDOverMSP 的说明）。
+ *       注意这里只改 RAM 里的 config，不 Commit——真正的落盘发生在
+ *       ExitBindingMode()，因为绑定过程中不能阻塞 Flash 写。
+ */
 void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t* newUid4)
 {
     // Binding over MSP only contains 4 bytes due to packet size limitations, clear out any leading bytes
@@ -948,6 +1127,14 @@ void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t* newUid4)
     config.SetUID(UID);
 }
 
+/**
+ * @brief 处理上行数据包（PACKET_TYPE_DATA）：绑定握手 / MAVLink / CRSF
+ * @param otaPktPtr 已通过 CRC 的 OTA 包
+ * @note 绑定检测放在“连接检查”之前：绑定过程中 connectionState 还不是 connected，
+ *       若先判连接就会漏掉绑定包。判据是 packageIndex==1 且首字节为 MSP_ELRS_BIND，
+ *       即“StubbornSender 的第一包”。
+ *       MAVLink 模式下额外用 payload 里的 stubbornAck 确认下行数据。
+ */
 static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(OTA_Packet_s const * const otaPktPtr)
 {
     if (firmwareOptions.is_airport)
@@ -996,6 +1183,14 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(OTA_Packet_s const * const ot
     }
 }
 
+/**
+ * @brief 根据 SYNC 里的开关编码字节，决定“立即切换 / 等待确认 / 取消”
+ * @param newSwitchMode SYNC 包里的 switchEncMode 字段
+ * @note 两段式确认的编码技巧：`newSwitchMode + 1` 表示已确认，
+ *       而 `-(newSwitchMode) - 1` 表示“待确认”（负值）。
+ *       这样 0 就只表示“无待处理”，不需要额外的布尔变量。
+ *       必须连续两个 SYNC 携带同一新模式才真正切换，防止单包误码导致模式跳变。
+ */
 static void ICACHE_RAM_ATTR updateSwitchModePendingFromOta(uint8_t newSwitchMode)
 {
     if (OtaSwitchModeCurrent == newSwitchMode)
@@ -1028,6 +1223,19 @@ static void ICACHE_RAM_ATTR updateSwitchModePendingFromOta(uint8_t newSwitchMode
     }
 }
 
+/**
+ * @brief 处理 SYNC 包：校验 UID → 校验速率合法性 → 对齐跳频/nonce → 进入 tentative
+ * @param now 当前 millis
+ * @param otaSync 指向解出的 sync 结构
+ * @return true 表示本次 SYNC 引起了“重新对齐”（调用者据此决定是否启动定时器）
+ * @note 这是 RX 与 TX 建立同步的唯一入口，四层校验顺序不能变：
+ *       1) UID4 必须严格相等（第一道门，滤掉别人的 TX）；
+ *       2) UID5 的高 2 位（~MODELMATCH_MASK）必须相等，低 6 位留给 ModelMatch；
+ *       3) 提议的速率必须在本硬件支持表里（否则旧固件/异型硬件会跳进无效档位）；
+ *       4) 只有当 nonce/fhssIndex/modelMatch 与当前不一致时才真正重对齐，
+ *          否则每收到一个 SYNC 都重启定时器会导致链路抖动。
+ *       Return true 时 loop() 会 resume 定时器，从这一刻开始“跟拍”。
+ */
 static bool ICACHE_RAM_ATTR ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const * const otaSync)
 {
     // Verify the first byte of the binding ID, which should always match
@@ -1114,6 +1322,16 @@ static bool ICACHE_RAM_ATTR ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s 
     return false;
 }
 
+/**
+ * @brief 所有 OTA 包的统一入口：CRC → 相位打点 → 分类型分发 → 统计/校准
+ * @param status 射频驱动的硬件 CRC 结果
+ * @return true 表示包有效
+ * @note 最精妙的一段是 PFDloop.extEvent() 的时间点计算：
+ *       slack = max(interval - 2*TOA, 200us)。
+ *       对“TOA > 半个周期”的低速档，Tock 被安排在“TX 周期结束前约 1 个 TOA”，
+ *       这样 RX 的发射窗口正好落进 TX 的接收窗口；对高速档则固定 200us 余量。
+ *       这个值算错会表现为“能收不能发”（遥测全丢）。
+ */
 bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
 {
     if (status != SX12xxDriverCommon::SX12XX_RX_OK)
@@ -1218,6 +1436,15 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
     return true;
 }
 
+/**
+ * @brief 收包完成 ISR：同一拍只处理一次，必要时启动定时器
+ * @param status 硬件 CRC 结果
+ * @return true 表示包被接受
+ * @note 第一个 if 的语义是“本拍已经收到过包且已连接”→ 直接丢弃第二个中断，
+ *       防止同频干扰导致的重复触发把 LQ 刷成 100。
+ *       doStartTimer 只在 SYNC 成功且不在绑定模式时为真，是 RX 从“自由轮询”
+ *       切换到“跟拍”的唯一时刻。
+ */
 bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
 {
     if (LQCalc.currentIsSet() && connectionState == connected)
@@ -1238,6 +1465,10 @@ bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
     return false;
 }
 
+/**
+ * @brief 发射完成 ISR：立刻回到接收模式（RX 的发射窗口极短，必须马上切回）
+ * @note LBT 模式下顺便重启 CCA 计时器，为下一次“先听后发”准备。
+ */
 void ICACHE_RAM_ATTR TXdoneISR()
 {
     Radio.RXnb();
@@ -1250,6 +1481,12 @@ void ICACHE_RAM_ATTR TXdoneISR()
 /**
  * Process the assembled uplink data packet in DataUlBuffer[]
  **/
+/**
+ * @brief 一包上行数据重组完成后按首字节分发（WiFi 请求 / MAVLink / CRSF）
+ * @note WiFi 切换故意延迟 500ms：先把 ACK 发回 TX 让 StubbornSender 收尾，
+ *       否则 RX 一关射频，TX 会一直重发同一包直到超时，用户看到的是“卡住”。
+ *       最后必须 DataUlReceiver.Unlock()，否则接收器不会再接受下一包。
+ */
 void DataUlReceiveComplete()
 {
     switch (DataUlBuffer[0])
@@ -1278,6 +1515,14 @@ void DataUlReceiveComplete()
     DataUlReceiver.Unlock();
 }
 
+/**
+ * @brief 按配置选择并初始化主串口协议（CRSF/SBUS/SUMD/MAVLink/HoTT/GPS...）
+ * @note 协议与波特率/校验位/反相的对应关系都在这一个函数里，归纳如下：
+ *       CRSF 420k(默认 uart_baud) 8N1；SBUS 100k 8E2 反相；SUMD 115200 8N1；
+ *       MAVLink 460800 8N1；HoTT 19200 8N2；SmartAudio 4800 8N2；
+ *       Tramp 9600 8N1；DisplayPort 115200；GPS 115200。
+ *       若硬件没有串口引脚（纯 PWM 接收机），走 SerialNOOP 且只保留日志口。
+ */
 static void setupSerial()
 {
     bool sbusSerialOutput = false;
@@ -1431,6 +1676,11 @@ static void setupSerial()
 }
 
 #if defined(PLATFORM_ESP32)
+/**
+ * @brief 关闭第二串口并释放 SerialIO 对象（仅 ESP32）
+ * @note 先 `Serial1.end()` 释放硬件，再 delete 驱动对象；顺序反了会导致
+ *       驱动析构时回调一个已经失效的 UART。
+ */
 static void serial1Shutdown()
 {
     if(serial1IO != nullptr)
@@ -1441,6 +1691,12 @@ static void serial1Shutdown()
     }
 }
 
+/**
+ * @brief 初始化第二路串口（仅 ESP32）
+ * @note 引脚来源有两级：先用硬件定义的 GPIO_PIN_SERIAL1_RX/TX，
+ *       若未定义则扫描 PWM 通道表，看用户有没有把某个焊盘配成 somSerial1RX/TX。
+ *       这样同一份固件既能支持“固定第二串口”的板子，也能支持“焊盘复用”的板子。
+ */
 static void setupSerial1()
 {
     //
@@ -1525,6 +1781,11 @@ static void setupSerial1()
     }
 }
 
+/**
+ * @brief 第二串口的“先拆后建”重配入口
+ * @note 配置里的 Serial1 协议改变后由设备层调用；必须先 shutdown，
+ *       否则旧驱动对象会与新 UART 参数并存，造成帧解析错乱。
+ */
 void reconfigureSerial1()
 {
     serial1Shutdown();
@@ -1535,6 +1796,12 @@ void reconfigureSerial1()
     void reconfigureSerial1() {};
 #endif
 
+/**
+ * @brief 关闭主串口：日志流换成 NullStream，释放 SerialIO
+ * @note 先把 `BackpackOrLogStrm` 指向 NullStream，再做 `Serial.end()`；
+ *       否则在 `Serial.end()` 之后、日志指针更新之前若有 DBG 输出，
+ *       会写到一个已关闭的 UART。这个顺序是防崩溃的关键。
+ */
 static void serialShutdown()
 {
     BackpackOrLogStrm = new NullStream();
@@ -1546,12 +1813,24 @@ static void serialShutdown()
     }
 }
 
+/**
+ * @brief 主串口的“先拆后建”重配入口（配置变更后调用）
+ * @note 典型触发点：SYNC 包里 otaProtocol 变化导致 CRSF↔MAVLink 切换时，
+ *       `ProcessRfPacket_SYNC()` 会 `deferExecutionMillis(100, reconfigureSerial)`，
+ *       等当前帧发完再重配。
+ */
 void reconfigureSerial()
 {
     serialShutdown();
     setupSerial();
 }
 
+/**
+ * @brief EEPROM 初始化 + 上电计数（三插拔进入绑定的实现）
+ * @note “三插拔绑定”原理：每次上电把 PowerOnCounter+1，若 2 秒内没连上就清零；
+ *       连续三次上电都很快断电，计数就会累计到 3，updateBindingMode() 据此进绑定。
+ *       这是一种不需要按键/不进 WiFi 的应急绑定方式。
+ */
 static void setupConfigAndPocCheck()
 {
     eeprom.Begin();
@@ -1575,6 +1854,9 @@ static void setupConfigAndPocCheck()
     });
 }
 
+/**
+ * @brief 板级引脚初始化（天线选择/天线组）+ 公共 I2C 初始化
+ */
 static void setupTarget()
 {
     if (GPIO_PIN_ANT_CTRL != UNDEF_PIN)
@@ -1591,6 +1873,11 @@ static void setupTarget()
     setupTargetCommon();
 }
 
+/**
+ * @brief 若已绑定则把 EEPROM 里的 UID 载入 RAM，并派生空口 CRC 初值
+ * @note 未绑定时故意不载入任何 UID（保持全 0），OtaUidIsBound() 会因此返回 false，
+ *       updateBindingMode() 随即自动进入绑定模式——这就是“新接收机上电即待绑定”。
+ */
 static void setupBindingFromConfig()
 {
     // VolatileBind's only function is to prevent loading the stored UID into RAM
@@ -1606,6 +1893,15 @@ static void setupBindingFromConfig()
     OtaUpdateCrcInitFromUid();
 }
 
+/**
+ * @brief 射频芯片初始化并进入首个守听速率
+ * @note 三个易错点：
+ *       1) Radio.currFreq 必须先设成初始频率，Begin() 内部会用它做 sanity check；
+ *       2) DynamicPower_UpdateRx(true) 要在 SetRFLinkRate() 之前，因为 LR1121
+ *          在 Config() 里就会写 PA 功率寄存器；
+ *       3) scanIndex 从“上次成功速率”开始，并跳过本硬件不支持的档位——否则
+ *          单频段硬件会先花一个完整轮询周期去试根本不存在的双频档。
+ */
 static void setupRadio()
 {
     ChannelDataReset();
@@ -1649,6 +1945,11 @@ static void setupRadio()
     RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow / 2;
 }
 
+/**
+ * @brief 计算本速率/回传比下“一次能连发几帧遥测”，并通知 StubbornSender
+ * @note telemBurstValid 是脏标记：只有速率或 TLM 比例变化后才重算，
+ *       避免每轮 loop 都做一次除法（ESP8266 上除法很贵）。
+ */
 static void updateTelemetryBurst()
 {
     if (telemBurstValid)
@@ -1664,6 +1965,16 @@ static void updateTelemetryBurst()
 
 /* If not connected will rotate through the RF modes looking for sync
  * and blink LED
+ */
+/**
+ * @brief 未连接时轮询所有速率档位，直到收到 SYNC
+ * @param now 当前 millis
+ * @note 时间参数是 cycleInterval * RFmodeCycleMultiplier：
+ *       multiplier 初始为 RFmodeCycleMultiplierSlow/2（setup 里设的），
+ *       每成功收到一包就重置为 Slow(10)，一旦进入 FAST_SYNC（换档后）变 1。
+ *       效果是“刚换档时每 1 个周期就换下一个档，久未成功则拉长到 10 个周期再换”，
+ *       兼顾冷启动速度与稳态省电。
+ *       LockRFmode 为真时完全不换档（竞赛模式）。
  */
 static void cycleRfMode(unsigned long now)
 {
@@ -1695,6 +2006,13 @@ static void cycleRfMode(unsigned long now)
     } // if time to switch RF mode
 }
 
+/**
+ * @brief RX 进入绑定模式：锁 50Hz + invertIQ + CRC 初值用协议版本号
+ * @note 三条进入条件由 updateBindingMode() 决定（未绑定/三插拔/OTA 请求），
+ *       本函数只负责执行。BINDSTORAGE_ADMINISTERED 表示“只允许 Web UI 绑定”，
+ *       此时任何物理方式都被拒绝（防盗/防误绑）。
+ *       ReturnLoan() 会清掉“借用模型”状态——绑定即视为归还。
+ */
 static void EnterBindingMode()
 {
     if (InBindingMode)
@@ -1729,6 +2047,12 @@ static void EnterBindingMode()
     devicesTriggerEvent(EVENT_ENTER_BIND_MODE);
 }
 
+/**
+ * @brief RX 退出绑定模式：落盘 UID → 重建跳频表 → 复位链路状态
+ * @note 顺序极其重要，末尾的注释已经点明：LostConnection(false) 会等一个
+ *       “永远不来的 Tock”（绑定模式下定时器没跑），所以 InBindingMode=false
+ *       必须放在它之后。这是本文件里最容易踩的时序坑之一。
+ */
 static void ExitBindingMode()
 {
     if (!InBindingMode)
@@ -1762,6 +2086,19 @@ static void ExitBindingMode()
     devicesTriggerEvent(EVENT_EXIT_BIND_MODE);
 }
 
+/**
+ * @brief 每轮 loop 检查所有“该不该进/该不该出绑定模式”的条件
+ * @param now 当前 millis
+ * @note 五个分支自上而下优先级递减：
+ *       1) 配置被改（UID 已写入）→ 退出绑定；
+ *       2) LR1121/LR2021 绑定期间每 125ms 在 900M/2.4G 之间跳，
+ *          让单射频 TX 也能撞上双频 RX（兼容性设计）；
+ *       3) 上电计数 >=3 → 进绑定；
+ *       4) 未绑定 → 进绑定；
+ *       5) 收到 OTA/按键的绑定请求 → 若已连接先断开再进。
+ *       分支 5 里“借来的模型”处理是安全设计：直接让 RX 变砖式静默，
+ *       防止丢失的飞机在野外被别人重新绑定。
+ */
 static void updateBindingMode(unsigned long now)
 {
 #if defined(RADIO_LR1121) || defined(RADIO_LR2021)
@@ -1838,6 +2175,13 @@ static void updateBindingMode(unsigned long now)
     }
 }
 
+/**
+ * @brief 对外的“安全绑定”入口（按键/Web UI/OTA 命令都走这里）
+ * @note 三种前置状态分别处理：
+ *       - serialUpdate / 已在绑定 → 直接拒绝（刷机中不能切射频）；
+ *       - wifiUpdate / bleJoystick → 置 PowerOnCounter=3 后重启，用“三插拔”等效实现；
+ *       - connected → 只置请求标志，交给 updateBindingMode() 在安全时机断开再绑。
+ */
 void EnterBindingModeSafely()
 {
     // Will not enter Binding mode if in the process of a passthrough update
@@ -1868,6 +2212,12 @@ void EnterBindingModeSafely()
     EnterBindingMode();
 }
 
+/**
+ * @brief 每 100ms 向飞控发一次 CRSF LinkStatistics（0x14）帧
+ * @param now 当前 millis
+ * @note 断线时仍然发（这是刻意设计）：飞控需要看到 LQ 掉到 0 才会触发 failsafe；
+ *       若断线就不发，飞控会以为“接收机还在、只是没数据”，反而更危险。
+ */
 static void checkSendLinkStatsToFc(uint32_t now)
 {
     if (now - SendLinkStatstoFCintervalLastSent > SEND_LINK_STATS_TO_FC_INTERVAL)
@@ -1889,6 +2239,12 @@ static void checkSendLinkStatsToFc(uint32_t now)
     }
 }
 
+/**
+ * @brief 调试用：把 linkStats 打成一行 CSV 从日志口输出（仅 DEBUG_RCVR_LINKSTATS）
+ * @note 注释里提到“while YOLOing (const void *) away the volatile”——
+ *       这里用强制类型转换绕开 volatile，一次性整体拷贝，
+ *       比逐字段读更不容易读到“半新半旧”的组合（拼包撕裂）。
+ */
 static void debugRcvrLinkstats()
 {
 #if defined(DEBUG_RCVR_LINKSTATS)
@@ -1917,6 +2273,11 @@ static void debugRcvrLinkstats()
 #endif
 }
 
+/**
+ * @brief 调试用：每秒打印一次每颗射频的 irq 计数/平均 RSSI/平均 SNR/遥测次数
+ * @note 打印完立即清零累加器，所以每行都是“过去 1 秒的统计”，
+ *       适合观察分集效果（两颗射频的 rssi_sum 差异）。
+ */
 static void debugRcvrSignalStats(uint32_t now)
 {
 #if defined(DEBUG_RCVR_SIGNAL_STATS)
@@ -1958,6 +2319,14 @@ static void debugRcvrSignalStats(uint32_t now)
 #endif
 }
 
+/**
+ * @brief 应用待生效的开关编码模式切换
+ * @note SwitchModePending 有三种取值：
+ *       <=0 表示“无待处理”或“等待下一包确认”（负数是防误切的中间态）；
+ *       >0  表示“已确认，执行切换”，真实模式 = Pending-1。
+ *       切换时必须清空 ChannelData 与完整性标记，否则新旧编码混在一起
+ *       会解出乱跳的通道值。
+ */
 static void updateSwitchMode()
 {
     // Negative value means waiting for confirm of the new switch mode while connected
@@ -1970,6 +2339,13 @@ static void updateSwitchMode()
     SwitchModePending = 0;
 }
 
+/**
+ * @brief 主循环里的配置落盘点
+ * @note 条件里的 connectionState < NO_CONFIG_SAVE_STATES 很重要：
+ *       WiFi 升级/串口刷机等特殊状态下不允许写 EEPROM（会与刷写冲突）。
+ *       写之前先 LostConnection(false) 让射频停在一个确定状态，
+ *       写完再由调用者 Radio.RXnb() 恢复守听。
+ */
 static void CheckConfigChangePending()
 {
     if (config.IsModified() && !InBindingMode && connectionState < NO_CONFIG_SAVE_STATES)
@@ -1999,6 +2375,11 @@ RF_PRE_INIT()
 }
 #endif
 
+/**
+ * @brief 清配置并重启：EEPROM 恢复默认 + 格式化 LittleFS（删 options.json/hardware.json）
+ * @note 两次 yield() 是为了喂看门狗：Flash 擦除期间 WDT 可能超时重启，
+ *       那样会留下“配置清了一半”的砖机状态。
+ */
 void resetConfigAndReboot()
 {
     config.SetDefaults(true);
@@ -2014,6 +2395,14 @@ void resetConfigAndReboot()
     ESP.restart();
 }
 
+/**
+ * @brief 上电初始化：选项 → 配置 → 板级 → 串口 → 设备 → 绑定信息 → 射频
+ * @note 与 TX 版本的差异：
+ *       - RX 先做 setupConfigAndPocCheck()（要读 EEPROM 决定串口协议），
+ *       而 TX 是最后才 config.Load()；
+ *       - RX 没有“awaitingModelId”，初始化完直接 RXnb() 守听；
+ *       - 只有射频初始化成功才启动定时器，否则停在 radioFailed 便于 Web UI 报错。
+ */
 void setup()
 {
     if (!options_init())
@@ -2104,6 +2493,16 @@ void setup()
     RFmodeLastCycled = millis();
 }
 
+/**
+ * @brief 主循环（ESP32-C3 下由 loop() 包装调用）
+ * @note 状态机判定顺序即优先级，归纳为本文件的“四条时间线”：
+ *       1) 速率被强制变更（TX 要求换档）→ LostConnection(true)；
+ *       2) tentative 超过 RxLockTimeoutMs 仍没连上 → 放弃这次 SYNC；
+ *       3) connected 超过 DisconnectTimeoutMs 没收到包 → 掉线；
+ *       4) tentative 且频偏/相位/LQ 都达标 → GotConnection()。
+ *       最后的 DynamicPower_UpdateRx/updateTelemetryBurst 等都是“慢工作”，
+ *       放在状态判定之后可以保证关键路径优先。
+ */
 #if defined(PLATFORM_ESP32_C3)
 void main_loop()
 #else
@@ -2189,6 +2588,12 @@ void loop()
     debugRcvrSignalStats(now);
 }
 
+/**
+ * @brief ESP32-C3 专用死循环：绕开 Arduino 每 2 秒一次的 yield
+ * @note C3 的 Arduino 主循环会周期性 vTaskDelay，导致 RX 错过 Tock 而掉线，
+ *       所以这里自己起一个不进 yield 的 for(;;)，并手动喂任务看门狗。
+ *       这是“平台缺陷导致的架构妥协”，不是设计初衷。
+ */
 #if defined(PLATFORM_ESP32_C3)
 [[noreturn]] void loop()
 {
@@ -2209,6 +2614,13 @@ struct bootloader {
     uint32_t reset_type;
 };
 
+/**
+ * @brief 通过串口命令让 MCU 重启进 bootloader（用于 passthrough 刷机）
+ * @note 先打印 target_name+4 作为握手串（形如 “ESP32…”），
+ *       上位机 Configurator 收到后才开始发固件。ESP8266 用 SDK 的
+ *       rebootIntoUartDownloadMode()，ESP32 只能切 serialUpdate 状态后靠
+ *       外部复位/看门狗进入下载模式。
+ */
 void reset_into_bootloader(void)
 {
     SERIAL_PROTOCOL_TX.println((const char *)&target_name[4]);

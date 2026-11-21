@@ -1,3 +1,26 @@
+/*
+ * ============================================================================
+ * 【中文导读】rxtx_common.cpp —— TX/RX 共用的小工具：延迟执行、I2C、定时重启
+ * ----------------------------------------------------------------------------
+ * 文件职责：
+ *   1. 提供 3 槽位的“延迟函数队列”（deferExecutionMicros/Millis），
+ *      让 ISR 或设备回调可以把“不能在中断里做”的事推迟到主循环执行；
+ *   2. setupTargetCommon()：按引脚定义/用户 PWM 配置决定是否启用 I2C 总线；
+ *   3. scheduleRebootTime()/checkRebootTime()：主循环里安全重启（等配置写完）。
+ *
+ * 主要函数：
+ *   setupWire()               —— 解析 SCL/SDA 引脚并初始化 400kHz I2C
+ *   setupTargetCommon()       —— 板级公共初始化入口（TX/RX 的 setupTarget 都调它）
+ *   deferExecutionMicros()    —— 投递一个延迟执行任务（最多 3 个排队）
+ *   executeDeferredFunction() —— 主循环里检查到期并执行
+ *   scheduleRebootTime()      —— 预约重启时刻
+ *   checkRebootTime()         —— 到点且配置已落盘则 ESP.restart()
+ *
+ * 为什么只有 3 个槽位：延迟执行只用于“极少数必须延后”的动作
+ * （如 LBT 下补发 TXdone、WiFi/串口切换、清上电计数），
+ * 用静态数组避免动态分配，槽位满时打印错误并丢弃——这是刻意的“宁可丢也不阻塞”。
+ * ============================================================================
+ */
 #include "targets.h"
 #include "common.h"
 #include "config.h"
